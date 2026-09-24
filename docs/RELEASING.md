@@ -22,7 +22,7 @@ phones home afterwards.
 | `Packaging/toolchain.env` | Pins the Xcode a build uses. Both workflows read it. |
 | `Scripts/release.sh` | The whole build, locally and on the runner: preflight, lints, tests, release products, bundle, signing, notarization, DMG, verification, artifacts. Twelve stages, each `PASS` / `FAIL` / `SKIP (reason)`. |
 | `.github/workflows/ci.yml` | Runs on GitHub for every push and pull request: `Scripts/release.sh --ci --skip-dmg --allow-dirty`. No secrets, no DMG. |
-| `.github/workflows/release.yml` | Runs on GitHub for every `v*.*.*` tag (and manual runs): the full build, then a **draft** GitHub release. |
+| `.github/workflows/release.yml` | Runs on GitHub for every `v*.*.*` tag (and manual runs): the full build, then a published GitHub release. |
 
 `Scripts/release.sh` writes everything into `dist/<version>/`:
 
@@ -106,7 +106,7 @@ publish; a manual run on a branch builds artifacts only and creates no release).
 8. Artifact collection: exactly one DMG in `dist/<version>/`, plus `SHA256SUMS.txt`, `release-notes.md` and
    `bundle-manifest.txt`. The checksums and `build-info.json` are copied into the run summary.
 9. `actions/attest-build-provenance` signs a provenance statement for the DMG (§8).
-10. `gh release create "$TAG" --draft …` with the DMG and `SHA256SUMS.txt`. **Always a draft.** A re-run of the
+10. `gh release create "$TAG" --latest …` with the DMG and `SHA256SUMS.txt`, published at once. A re-run of the
     same tag replaces the assets instead of failing.
 11. dSYMs, logs, `bundle-manifest.txt` and `build-info.json` go up as a workflow artifact (90 days), never as
     release assets. On a **public** repository a workflow artifact is not private: anyone with a GitHub
@@ -115,9 +115,9 @@ publish; a manual run on a branch builds artifacts only and creates no release).
     contents as published, and download the dSYM before it expires rather than leaving it as your only copy.
 12. `if: always()`: the temporary keychain is deleted, the search list restored, and the `.p12`/`.p8` files removed.
 
-### Publishing the draft
+### Checking the release
 
-1. Open the draft release. Check the title, the notes (English and Russian) and that exactly the DMG and
+1. Open the release. Check the title, the notes (English and Russian) and that exactly the DMG and
    `SHA256SUMS.txt` are attached.
 2. Download the DMG, verify it, and install it once from `/Applications`:
 
@@ -149,10 +149,10 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer   # or the pinne
 Scripts/release.sh                                                # add --require-notarization with credentials
 ```
 
-The result lands in `dist/<version>/`. Then create the same draft by hand:
+The result lands in `dist/<version>/`. Then create the same release by hand:
 
 ```bash
-gh release create v1.0.0 --draft --title "Codometer 1.0.0" \
+gh release create v1.0.0 --latest --title "Codometer 1.0.0" \
   --notes-file dist/1.0.0/release-notes.md \
   dist/1.0.0/Codometer-1.0.0.dmg dist/1.0.0/SHA256SUMS.txt
 ```
@@ -309,14 +309,14 @@ Until then the DMG is ad hoc, users see Gatekeeper's "Apple could not verify…"
 | `No Developer ID identity` | The `.p12` decoded but holds no signing identity | Re-export the certificate **with** its private key |
 | The DMG came out ad hoc although the secrets exist | `CODOMETER_DEVELOPER_ID_P12_BASE64` is missing or empty | The `Detect signing and notary secrets` step prints the mode it chose and warns about a half-configured set (§9) |
 | The release run finished but there is no release | The run was not on a tag | Dispatch it again with a tag selected, or push the tag |
-| `gh release create` says the release exists | A previous run already created the draft | Nothing: the workflow uploads over it. Delete the draft to start clean |
+| `gh release create` says the release exists | A previous run already created the release | Nothing: the workflow uploads over it. Delete the release to start clean |
 | CI fails only on the runner | Almost always the toolchain warning above it, or a test that depends on the system language | Reproduce with `Scripts/release.sh --ci --skip-dmg --allow-dirty` locally |
 
 ---
 
 ## 11. House rules
 
-- Releases are **drafts** until a human publishes them.
+- A green release run publishes the release; check it right after (see “Checking the release”).
 - dSYMs are never a release asset — and a workflow artifact on a public repository is not a private place
   either (§4).
 - The DMG keeps the same public name in every signing mode; the mode lives in `build-info.json` and the notes.

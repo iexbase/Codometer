@@ -410,7 +410,7 @@ Scripts/dev-register.sh build/Codometer.app   # сделать эту копию
   изолированные папки данных и правила регистрации.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — модули, поток данных, расписание опроса, хранилище, виджет.
 - [docs/LOCALIZATION.md](docs/LOCALIZATION.md) — как пишется и проверяется текст на двух языках.
-- [docs/RELEASING.md](docs/RELEASING.md) — версии, CI, подпись, нотаризация, черновик релиза.
+- [docs/RELEASING.md](docs/RELEASING.md) — версии, CI, подпись, нотаризация, релиз.
 
 ---
 

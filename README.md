@@ -405,7 +405,7 @@ More for contributors:
   data roots, and the registration rules.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — modules, data flow, polling schedule, storage, widget.
 - [docs/LOCALIZATION.md](docs/LOCALIZATION.md) — how English and Russian text is written and checked.
-- [docs/RELEASING.md](docs/RELEASING.md) — versions, CI, signing, notarization, the draft release.
+- [docs/RELEASING.md](docs/RELEASING.md) — versions, CI, signing, notarization, the release.
 
 ---
 

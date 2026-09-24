@@ -1,4 +1,4 @@
-# Builds the public Codometer DMG and opens a DRAFT GitHub release. A human publishes it.
+# Builds the public Codometer DMG and publishes it as a GitHub release.
 #
 # Triggers: a `v*.*.*` tag, or a manual run (pick a tag in the "Run workflow" dialog to publish; a run on a
 # branch only builds artifacts).
@@ -33,7 +33,7 @@ defaults:
 
 jobs:
   release:
-    name: Build, sign and draft
+    name: Build, sign and release
     runs-on: macos-26
     timeout-minutes: 180
     steps:
@@ -179,7 +179,7 @@ jobs:
             fi
             publish=true
           else
-            echo "::notice title=No tag::This run builds artifacts only. A draft release is created only for a 'v*.*.*' tag."
+            echo "::notice title=No tag::This run builds artifacts only. A release is published only for a 'v*.*.*' tag."
           fi
           {
             echo "version=$version"
@@ -366,7 +366,7 @@ jobs:
         with:
           subject-path: ${{ steps.artifacts.outputs.dmg }}
 
-      - name: Create the draft release
+      - name: Publish the release
         if: steps.version.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -377,19 +377,20 @@ jobs:
         run: |
           set +x
           set -euo pipefail
-          # Always a draft: a human checks the notes and the DMG, then publishes.
+          # Published at once, so the DMG can be downloaded as soon as the run is green.
           # `set +x` because GH_TOKEN is a credential like any other, even though the runner masks it.
           if gh release view "$TAG" > /dev/null 2>&1; then
             echo "Release $TAG exists; replacing its assets."
             gh release upload "$TAG" "$DMG" "$DIR/SHA256SUMS.txt" --clobber
+            gh release edit "$TAG" --draft=false --latest
           else
             gh release create "$TAG" \
-              --draft \
+              --latest \
               --title "Codometer $VERSION" \
               --notes-file "$DIR/release-notes.md" \
               "$DMG" "$DIR/SHA256SUMS.txt"
           fi
-          echo "- Draft release $TAG created. Publish it by hand after checking the notes and the DMG." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Release $TAG published with the DMG and its checksums." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload dSYMs, logs and manifests
         if: always()
