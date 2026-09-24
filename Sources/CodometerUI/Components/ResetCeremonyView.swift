@@ -116,7 +116,8 @@ final class ResetCeremonyView: LiveLayerView {
     private var ceremony: ResetCeremony?
     private var fraction: Double = 0
     private var delay: CFTimeInterval = 0
-    private var reduceMotion = false
+    /// Read by tests: which plan `play` runs.
+    private(set) var reduceMotion = false
     /// The last ceremony this view actually played, so a re-render never replays it.
     private var playedID: UUID?
 

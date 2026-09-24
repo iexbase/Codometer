@@ -164,6 +164,17 @@ struct CeremonySurfacesTests {
 
         let layers = try #require(ring.layer?.sublayers) as [CALayer]
         let flash = try #require(layers.first { ($0 as? CAShapeLayer)?.fillColor == nil })
+
+        // A Mac with Reduce Motion on (build machines often have it) plays the reduced plan: the green ring only
+        // fades, and there is no glint to ride the arc.
+        if ring.reduceMotion {
+            #expect(layers.first { ($0 as? CAShapeLayer)?.fillColor != nil } == nil)
+            let fade = try #require(flash.animation(forKey: "flash") as? CABasicAnimation)
+            #expect(fade.keyPath == "opacity")
+            #expect(fade.duration == ResetCeremonyPlan.reducedDuration)
+            return
+        }
+
         let glint = try #require(layers.first { ($0 as? CAShapeLayer)?.fillColor != nil })
 
         let flashGroup = try #require(flash.animation(forKey: "flash") as? CAAnimationGroup)
