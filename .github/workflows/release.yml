@@ -1,0 +1,426 @@
+# Builds the public Codometer DMG and opens a DRAFT GitHub release. A human publishes it.
+#
+# Triggers: a `v*.*.*` tag, or a manual run (pick a tag in the "Run workflow" dialog to publish; a run on a
+# branch only builds artifacts).
+#
+# Modes follow Scripts/release.sh: with no secrets the DMG is signed ad hoc, with a Developer ID certificate
+# it is signed properly, and with notary credentials it is notarized and stapled. Secrets are optional; every
+# step that touches one runs with `set +x` and masks what it derives. See docs/RELEASING.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      allow_toolchain_mismatch:
+        description: "Build even when the runner lacks the pinned Xcode (the result is no longer comparable with a local build)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Build, sign and draft
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # release.sh reads the tag and the commit time for the build number
+
+      - name: Select the pinned Xcode
+        env:
+          ALLOW_TOOLCHAIN_MISMATCH: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_toolchain_mismatch || false }}
+        run: |
+          set -euo pipefail
+          # Reads Packaging/toolchain.env and requires that exact Xcode, because the DMG is only comparable
+          # with a local build when the toolchain matches. Never sources the file: it is parsed, not executed.
+          env_file="Packaging/toolchain.env"
+
+          read_key() {
+            [[ -f "$env_file" ]] || return 0
+            sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=[[:space:]]*(.*)$/\2/p" "$env_file" \
+              | tail -n 1 \
+              | sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/'
+          }
+
+          first_value() {
+            local name value
+            for name in "$@"; do
+              value="$(read_key "$name")"
+              if [[ -n "$value" ]]; then
+                printf '%s' "$value"
+                return 0
+              fi
+            done
+          }
+
+          pinned_app="$(first_value CODOMETER_XCODE_APP XCODE_APP)"
+          pinned_version="$(first_value CODOMETER_XCODE_VERSION XCODE_VERSION)"
+          pinned_build="$(first_value CODOMETER_XCODE_BUILD XCODE_BUILD)"
+          if [[ -z "$pinned_app" && -n "$pinned_version" ]]; then
+            pinned_app="/Applications/Xcode_${pinned_version}.app"
+          fi
+          if [[ -z "$pinned_app" && -z "$pinned_version" && -z "$pinned_build" ]]; then
+            {
+              echo "::error title=Toolchain not pinned::Packaging/toolchain.env names no Xcode, so this release could not be reproduced."
+              echo "Set CODOMETER_XCODE_VERSION and CODOMETER_XCODE_BUILD (optionally CODOMETER_XCODE_APP) in Packaging/toolchain.env."
+              echo "docs/RELEASING.md lists the keys the workflows read."
+            } >&2
+            exit 1
+          fi
+          pinned_label="Xcode ${pinned_version:-?}${pinned_build:+ ($pinned_build)}"
+
+          describe() {   # describe <Xcode.app> -> "<version>\t<build>"
+            local app="$1" out version build
+            out="$(DEVELOPER_DIR="$app/Contents/Developer" /usr/bin/xcodebuild -version 2>/dev/null)" || return 1
+            version="$(printf '%s\n' "$out" | sed -n -E 's/^Xcode[[:space:]]+([0-9][0-9.]*)$/\1/p' | head -n 1)"
+            build="$(printf '%s\n' "$out" | sed -n -E 's/^Build version[[:space:]]+([A-Za-z0-9]+)$/\1/p' | head -n 1)"
+            [[ -n "$version" ]] || return 1
+            printf '%s\t%s' "$version" "$build"
+          }
+
+          candidates=()
+          [[ -n "$pinned_app" && -d "$pinned_app" ]] && candidates+=("$pinned_app")
+          while IFS= read -r app; do
+            [[ -n "$app" && -d "$app" ]] || continue
+            [[ "$app" == "$pinned_app" ]] && continue
+            candidates+=("$app")
+          done < <(ls -d /Applications/Xcode*.app 2>/dev/null | sort -rV)
+
+          selected=""; selected_version=""; selected_build=""
+          best=""; best_version=""; best_build=""
+          for app in "${candidates[@]:-}"; do
+            [[ -n "$app" ]] || continue
+            info="$(describe "$app")" || continue
+            version="${info%%$'\t'*}"; build="${info##*$'\t'}"
+            echo "Found Xcode $version ($build) at $app"
+            if [[ -z "$best" && "${version%%.*}" == "26" ]]; then
+              best="$app"; best_version="$version"; best_build="$build"
+            fi
+            matches=true
+            if [[ -n "$pinned_version" ]]; then
+              [[ "$version" == "$pinned_version" ]] || matches=false
+            else
+              [[ "${version%%.*}" == "26" ]] || matches=false   # Codometer needs the macOS 26 SDK
+            fi
+            [[ -n "$pinned_build" && -n "$build" && "$build" != "$pinned_build" ]] && matches=false
+            if [[ "$matches" == true && -z "$selected" ]]; then
+              selected="$app"; selected_version="$version"; selected_build="$build"
+            fi
+          done
+
+          if [[ -n "$selected" ]]; then
+            echo "Using the pinned toolchain: Xcode $selected_version ($selected_build) at $selected"
+            echo "- Toolchain: Xcode $selected_version ($selected_build), pinned" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${ALLOW_TOOLCHAIN_MISMATCH:-false}" == "true" && -n "$best" ]]; then
+            selected="$best"; selected_version="$best_version"; selected_build="$best_build"
+            echo "::warning title=Toolchain mismatch accepted::Building with Xcode $selected_version ($selected_build) instead of the pinned $pinned_label, because this run was dispatched with allow_toolchain_mismatch. The artifacts are not comparable with a local Scripts/release.sh build."
+            echo "- Toolchain: Xcode $selected_version ($selected_build) — **mismatch accepted**, pinned is $pinned_label" >> "$GITHUB_STEP_SUMMARY"
+            echo "TOOLCHAIN_MISMATCH=true" >> "$GITHUB_ENV"
+          else
+            {
+              echo "::error title=Pinned toolchain missing::This runner image does not have $pinned_label, which Packaging/toolchain.env pins."
+              if [[ -z "$best" ]]; then
+                echo "It has no Xcode 26.x at all, and Codometer needs the macOS 26 SDK."
+              fi
+              echo "Release artifacts must come from the pinned toolchain. Either wait for a runner image that carries it,"
+              echo "re-run this workflow from the Actions tab with allow_toolchain_mismatch enabled (the result is then not"
+              echo "comparable with a local build), or use the local fallback: run Scripts/release.sh on a Mac with the pinned"
+              echo "Xcode and upload the DMG by hand. Both paths are described in docs/RELEASING.md."
+            } >&2
+            exit 1
+          fi
+
+          echo "DEVELOPER_DIR=$selected/Contents/Developer" >> "$GITHUB_ENV"
+
+      - name: Print toolchain versions
+        run: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version
+          swift --version
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR"
+
+      - name: Resolve the version
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ ! -f Packaging/VERSION ]]; then
+            echo "::error title=Packaging/VERSION missing::The release pipeline reads the version from Packaging/VERSION." >&2
+            exit 1
+          fi
+          version="$(tr -d '[:space:]' < Packaging/VERSION)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Bad version::Packaging/VERSION holds '$version', which is not a MAJOR.MINOR.PATCH version." >&2
+            exit 1
+          fi
+          publish=false
+          tag=""
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            tag="$GITHUB_REF_NAME"
+            if [[ "$tag" != "v$version" ]]; then
+              echo "::error title=Tag does not match VERSION::The tag is '$tag' but Packaging/VERSION holds '$version'. Tag as 'v$version' or update Packaging/VERSION." >&2
+              exit 1
+            fi
+            publish=true
+          else
+            echo "::notice title=No tag::This run builds artifacts only. A draft release is created only for a 'v*.*.*' tag."
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "- Version: $version${tag:+, tag $tag}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Detect signing and notary secrets
+        id: secrets
+        env:
+          P12_BASE64: ${{ secrets.CODOMETER_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.CODOMETER_DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY_ID: ${{ secrets.CODOMETER_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.CODOMETER_NOTARY_ISSUER_ID }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.CODOMETER_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_APPLE_ID: ${{ secrets.CODOMETER_NOTARY_APPLE_ID }}
+          NOTARY_APP_PASSWORD: ${{ secrets.CODOMETER_NOTARY_APP_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.CODOMETER_NOTARY_TEAM_ID }}
+        run: |
+          set +x
+          set -euo pipefail
+          # Only booleans leave this step; no secret value is printed, written to a file or put in an output.
+          #
+          # The certificate secret alone decides the mode. A .p12 may legitimately be exported with an empty
+          # password, and demanding the password secret here would turn a half-configured repository into a
+          # silently ad-hoc signed release — exactly the failure Scripts/release.sh refuses to make. A wrong
+          # or missing password now fails the import step loudly instead.
+          has_certificate=false
+          if [[ -n "${P12_BASE64:-}" ]]; then has_certificate=true; fi
+          has_api_key=false
+          if [[ -n "${NOTARY_KEY_ID:-}" && -n "${NOTARY_ISSUER_ID:-}" && -n "${NOTARY_KEY_P8_BASE64:-}" ]]; then has_api_key=true; fi
+          has_apple_id=false
+          if [[ -n "${NOTARY_APPLE_ID:-}" && -n "${NOTARY_APP_PASSWORD:-}" && -n "${NOTARY_TEAM_ID:-}" ]]; then has_apple_id=true; fi
+          require_notarization=false
+          if [[ "$has_certificate" == true && ( "$has_api_key" == true || "$has_apple_id" == true ) ]]; then
+            require_notarization=true
+          fi
+          {
+            echo "has_certificate=$has_certificate"
+            echo "has_api_key=$has_api_key"
+            echo "has_apple_id=$has_apple_id"
+            echo "require_notarization=$require_notarization"
+          } >> "$GITHUB_OUTPUT"
+          if [[ "$has_certificate" == true ]]; then
+            echo "Developer ID certificate: present"
+            if [[ -z "${P12_PASSWORD:-}" ]]; then
+              echo "::warning title=No certificate password::CODOMETER_DEVELOPER_ID_P12_BASE64 is set but CODOMETER_DEVELOPER_ID_P12_PASSWORD is empty. The import assumes the .p12 was exported without a password and fails loudly if it was not."
+            fi
+          else
+            echo "Developer ID certificate: absent — the DMG will be signed ad hoc"
+            if [[ "$has_api_key" == true || "$has_apple_id" == true ]]; then
+              echo "::warning title=Notary credentials without a certificate::Notary credentials are configured but CODOMETER_DEVELOPER_ID_P12_BASE64 is not. Apple notarizes Developer ID signed code only, so this build stays ad hoc and nothing is notarized. Add the certificate secrets (docs/RELEASING.md §9)."
+            fi
+          fi
+          echo "Notarization: $require_notarization"
+
+      - name: Import the Developer ID certificate
+        if: steps.secrets.outputs.has_certificate == 'true'
+        env:
+          P12_BASE64: ${{ secrets.CODOMETER_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.CODOMETER_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          keychain="$RUNNER_TEMP/codometer-signing.keychain-db"
+          password="$(/usr/bin/openssl rand -base64 24)"
+          echo "::add-mask::$password"
+          p12="$RUNNER_TEMP/codometer-developer-id.p12"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$p12"
+
+          security list-keychains -d user | sed -E 's/^[[:space:]]*"?//; s/"?[[:space:]]*$//' > "$RUNNER_TEMP/keychains-before.txt"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          # An empty password is a valid .p12 export; a wrong one fails here, which is the point.
+          security import "$p12" -k "$keychain" -P "${P12_PASSWORD:-}" -T /usr/bin/codesign -T /usr/bin/security -f pkcs12
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
+          rm -f "$p12"
+
+          existing=()
+          while IFS= read -r line; do [[ -n "$line" ]] && existing+=("$line"); done < "$RUNNER_TEMP/keychains-before.txt"
+          if (( ${#existing[@]} > 0 )); then
+            security list-keychains -d user -s "$keychain" "${existing[@]}"
+          else
+            security list-keychains -d user -s "$keychain"
+          fi
+
+          identities="$(security find-identity -v -p codesigning "$keychain" | sed -n -E 's/.*"(Developer ID Application:.*)"$/\1/p')"
+          count="$(printf '%s' "$identities" | grep -c . || true)"
+          if [[ "$count" -eq 0 ]]; then
+            echo "::error title=No Developer ID identity::The imported certificate holds no 'Developer ID Application' identity usable for code signing." >&2
+            exit 1
+          fi
+          echo "Imported $count Developer ID Application identity/identities into a temporary keychain."
+
+      - name: Write the notary API key
+        if: steps.secrets.outputs.has_api_key == 'true'
+        env:
+          NOTARY_KEY_P8_BASE64: ${{ secrets.CODOMETER_NOTARY_KEY_P8_BASE64 }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          key_path="$RUNNER_TEMP/codometer-notary-key.p8"
+          printf '%s' "$NOTARY_KEY_P8_BASE64" | base64 --decode > "$key_path"
+          if [[ ! -s "$key_path" ]]; then
+            echo "::error title=Empty notary key::CODOMETER_NOTARY_KEY_P8_BASE64 did not decode into a key file." >&2
+            exit 1
+          fi
+          echo "CODOMETER_NOTARY_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+          echo "Wrote the App Store Connect API key to the runner's temporary directory (mode 0600)."
+
+      - name: Build, sign and package
+        env:
+          REQUIRE_NOTARIZATION: ${{ steps.secrets.outputs.require_notarization }}
+          CODOMETER_SIGN_IDENTITY: ${{ secrets.CODOMETER_SIGN_IDENTITY }}
+          CODOMETER_NOTARY_KEY_ID: ${{ secrets.CODOMETER_NOTARY_KEY_ID }}
+          CODOMETER_NOTARY_ISSUER_ID: ${{ secrets.CODOMETER_NOTARY_ISSUER_ID }}
+          CODOMETER_NOTARY_APPLE_ID: ${{ secrets.CODOMETER_NOTARY_APPLE_ID }}
+          CODOMETER_NOTARY_APP_PASSWORD: ${{ secrets.CODOMETER_NOTARY_APP_PASSWORD }}
+          CODOMETER_NOTARY_TEAM_ID: ${{ secrets.CODOMETER_NOTARY_TEAM_ID }}
+        run: |
+          set +x
+          set -euo pipefail
+          # An unset secret arrives as an empty variable; release.sh treats "set" as intent, so drop the empties.
+          for name in CODOMETER_SIGN_IDENTITY CODOMETER_NOTARY_KEY_ID CODOMETER_NOTARY_ISSUER_ID \
+                      CODOMETER_NOTARY_APPLE_ID CODOMETER_NOTARY_APP_PASSWORD CODOMETER_NOTARY_TEAM_ID; do
+            if [[ -z "${!name:-}" ]]; then unset "$name"; fi
+          done
+          args=(--ci)
+          if [[ "${REQUIRE_NOTARIZATION:-false}" == "true" ]]; then args+=(--require-notarization); fi
+          if [[ "${TOOLCHAIN_MISMATCH:-false}" == "true" ]]; then args+=(--allow-toolchain-mismatch); fi
+          echo "Scripts/release.sh ${args[*]}"
+          Scripts/release.sh "${args[@]}"
+
+      - name: Collect the artifacts
+        id: artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          dir="dist/$VERSION"
+          if [[ ! -d "$dir" ]]; then
+            echo "::error title=No artifacts::Scripts/release.sh did not produce $dir." >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          dmgs=("$dir"/*.dmg)
+          if (( ${#dmgs[@]} != 1 )); then
+            echo "::error title=Unexpected DMG count::Expected exactly one .dmg in $dir, found ${#dmgs[@]}." >&2
+            exit 1
+          fi
+          for required in SHA256SUMS.txt release-notes.md bundle-manifest.txt; do
+            if [[ ! -s "$dir/$required" ]]; then
+              echo "::error title=Missing $required::Scripts/release.sh did not write $dir/$required." >&2
+              exit 1
+            fi
+          done
+          {
+            echo "dir=$dir"
+            echo "dmg=${dmgs[0]}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "- DMG: \`$(basename "${dmgs[0]}")\`"
+            echo "- Checksums:"
+            echo '```'
+            cat "$dir/SHA256SUMS.txt"
+            echo '```'
+            if [[ -s "$dir/build-info.json" ]]; then
+              echo "- Build info:"
+              echo '```json'
+              cat "$dir/build-info.json"
+              echo '```'
+            fi
+            echo "- \`bundle-manifest.txt\` is attached to this run as an artifact: diff it against a local"
+            echo "  \`Scripts/release.sh\` run of the same commit, VERSION and build number to prove the builds match"
+            echo "  (binaries and signatures excepted — see docs/RELEASING.md)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.artifacts.outputs.dmg }}
+
+      - name: Create the draft release
+        if: steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DIR: ${{ steps.artifacts.outputs.dir }}
+          DMG: ${{ steps.artifacts.outputs.dmg }}
+        run: |
+          set +x
+          set -euo pipefail
+          # Always a draft: a human checks the notes and the DMG, then publishes.
+          # `set +x` because GH_TOKEN is a credential like any other, even though the runner masks it.
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG exists; replacing its assets."
+            gh release upload "$TAG" "$DMG" "$DIR/SHA256SUMS.txt" --clobber
+          else
+            gh release create "$TAG" \
+              --draft \
+              --title "Codometer $VERSION" \
+              --notes-file "$DIR/release-notes.md" \
+              "$DMG" "$DIR/SHA256SUMS.txt"
+          fi
+          echo "- Draft release $TAG created. Publish it by hand after checking the notes and the DMG." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload dSYMs, logs and manifests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.version.outputs.version || github.run_id }}-internals-${{ github.run_attempt }}
+          path: |
+            dist/*/logs/**
+            dist/*/*dSYM*.zip
+            dist/*/bundle-manifest.txt
+            dist/*/build-info.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Clean up the keychain and key files
+        if: always()
+        run: |
+          set +x
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/codometer-signing.keychain-db"
+          if [[ -f "$keychain" ]]; then
+            existing=()
+            if [[ -f "$RUNNER_TEMP/keychains-before.txt" ]]; then
+              while IFS= read -r line; do [[ -n "$line" ]] && existing+=("$line"); done < "$RUNNER_TEMP/keychains-before.txt"
+            fi
+            security delete-keychain "$keychain" 2> /dev/null || true
+            if (( ${#existing[@]} > 0 )); then
+              security list-keychains -d user -s "${existing[@]}" 2> /dev/null || true
+            fi
+          fi
+          rm -f "$RUNNER_TEMP"/codometer-developer-id.p12 \
+                "$RUNNER_TEMP"/codometer-notary-key.p8 \
+                "$RUNNER_TEMP"/keychains-before.txt
+          echo "Temporary keychain and credential files removed."

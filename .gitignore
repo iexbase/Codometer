@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Build products
+/.build/
+/build/
+/dist/
+/.swiftpm/
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+*.dSYM/
+
+# Editor settings
+/.vscode/
+/.idea/
+
+# Signing material and secrets never belong in the repository
+.env
+.env.*
+*.p12
+*.p8
+*.pem
+*.cer
+*.mobileprovision

@@ -1,0 +1,153 @@
+# Builds, tests and verifies Codometer on every push and pull request.
+#
+# The job runs exactly what a maintainer runs locally: `Scripts/release.sh --ci --skip-dmg --allow-dirty`
+# (preflight, lints, full test suite, both release products, bundle assembly, ad-hoc signing and the bundle
+# gates). No DMG, no notarization, no secrets: CI never needs them.
+#
+# The toolchain is pinned in Packaging/toolchain.env. If the runner image does not carry that exact Xcode,
+# this workflow falls back to the newest installed Xcode 26.x and prints a warning; the release workflow
+# fails instead. See docs/RELEASING.md.
+name: CI
+
+on:
+  push:
+    branches: ["**"]   # branch pushes only; tags are the release workflow's trigger
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build, test and verify (ad hoc)
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Select the pinned Xcode
+        run: |
+          set -euo pipefail
+          # Reads Packaging/toolchain.env, picks the pinned Xcode, and falls back to the newest
+          # installed Xcode 26.x with a warning. Never sources the file: it is parsed, not executed.
+          env_file="Packaging/toolchain.env"
+
+          read_key() {
+            [[ -f "$env_file" ]] || return 0
+            sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=[[:space:]]*(.*)$/\2/p" "$env_file" \
+              | tail -n 1 \
+              | sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/'
+          }
+
+          first_value() {
+            local name value
+            for name in "$@"; do
+              value="$(read_key "$name")"
+              if [[ -n "$value" ]]; then
+                printf '%s' "$value"
+                return 0
+              fi
+            done
+          }
+
+          pinned_app="$(first_value CODOMETER_XCODE_APP XCODE_APP)"
+          pinned_version="$(first_value CODOMETER_XCODE_VERSION XCODE_VERSION)"
+          pinned_build="$(first_value CODOMETER_XCODE_BUILD XCODE_BUILD)"
+          if [[ -z "$pinned_app" && -n "$pinned_version" ]]; then
+            pinned_app="/Applications/Xcode_${pinned_version}.app"
+          fi
+          has_pin=false
+          if [[ -n "$pinned_app" || -n "$pinned_version" || -n "$pinned_build" ]]; then has_pin=true; fi
+          pinned_label="Xcode ${pinned_version:-(any 26.x)}${pinned_build:+ ($pinned_build)}"
+
+          describe() {   # describe <Xcode.app> -> "<version>\t<build>"
+            local app="$1" out version build
+            out="$(DEVELOPER_DIR="$app/Contents/Developer" /usr/bin/xcodebuild -version 2>/dev/null)" || return 1
+            version="$(printf '%s\n' "$out" | sed -n -E 's/^Xcode[[:space:]]+([0-9][0-9.]*)$/\1/p' | head -n 1)"
+            build="$(printf '%s\n' "$out" | sed -n -E 's/^Build version[[:space:]]+([A-Za-z0-9]+)$/\1/p' | head -n 1)"
+            [[ -n "$version" ]] || return 1
+            printf '%s\t%s' "$version" "$build"
+          }
+
+          candidates=()
+          [[ -n "$pinned_app" && -d "$pinned_app" ]] && candidates+=("$pinned_app")
+          while IFS= read -r app; do
+            [[ -n "$app" && -d "$app" ]] || continue
+            [[ "$app" == "$pinned_app" ]] && continue
+            candidates+=("$app")
+          done < <(ls -d /Applications/Xcode*.app 2>/dev/null | sort -rV)
+
+          selected=""; selected_version=""; selected_build=""
+          best=""; best_version=""; best_build=""
+          for app in "${candidates[@]:-}"; do
+            [[ -n "$app" ]] || continue
+            info="$(describe "$app")" || continue
+            version="${info%%$'\t'*}"; build="${info##*$'\t'}"
+            echo "Found Xcode $version ($build) at $app"
+            if [[ -z "$best" && "${version%%.*}" == "26" ]]; then
+              best="$app"; best_version="$version"; best_build="$build"
+            fi
+            matches=true
+            if [[ -n "$pinned_version" ]]; then
+              [[ "$version" == "$pinned_version" ]] || matches=false
+            else
+              [[ "${version%%.*}" == "26" ]] || matches=false   # Codometer needs the macOS 26 SDK
+            fi
+            [[ -n "$pinned_build" && -n "$build" && "$build" != "$pinned_build" ]] && matches=false
+            if [[ "$matches" == true && -z "$selected" ]]; then
+              selected="$app"; selected_version="$version"; selected_build="$build"
+            fi
+          done
+
+          if [[ -n "$selected" && "$has_pin" == true ]]; then
+            echo "Using the pinned toolchain: Xcode $selected_version ($selected_build) at $selected"
+            echo "- Toolchain: Xcode $selected_version ($selected_build), pinned" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -n "$selected" ]]; then
+            echo "::warning title=Toolchain not pinned::Packaging/toolchain.env names no Xcode (CODOMETER_XCODE_VERSION, CODOMETER_XCODE_BUILD). Using Xcode $selected_version ($selected_build), the newest Xcode 26.x on this runner. Releases require a pinned toolchain (docs/RELEASING.md)."
+            echo "- Toolchain: Xcode $selected_version ($selected_build) — **not pinned**" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -n "$best" ]]; then
+            selected="$best"; selected_version="$best_version"; selected_build="$best_build"
+            echo "::warning title=Toolchain mismatch::Packaging/toolchain.env pins $pinned_label, which this runner image does not have. Using Xcode $selected_version ($selected_build) instead. Release builds require the pinned toolchain (docs/RELEASING.md)."
+            echo "- Toolchain: Xcode $selected_version ($selected_build) — **mismatch**, pinned is $pinned_label" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$has_pin" == true ]]; then
+            echo "::error title=No Xcode 26 on this runner::Codometer needs the macOS 26 SDK. Packaging/toolchain.env pins $pinned_label and this image has no Xcode 26.x at all. See docs/RELEASING.md."
+            exit 1
+          else
+            echo "::error title=No Xcode 26 on this runner::Codometer needs the macOS 26 SDK and this image has no Xcode 26.x at all. See docs/RELEASING.md."
+            exit 1
+          fi
+
+          echo "DEVELOPER_DIR=$selected/Contents/Developer" >> "$GITHUB_ENV"
+
+      - name: Print toolchain versions
+        run: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version
+          swift --version
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR"
+
+      - name: Build, test and verify
+        run: Scripts/release.sh --ci --skip-dmg --allow-dirty
+
+      - name: Upload build logs and manifests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/*/logs/**
+            dist/*/bundle-manifest.txt
+            dist/*/build-info.json
+          if-no-files-found: ignore
+          retention-days: 14

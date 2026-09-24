@@ -1,0 +1,37 @@
+# Exceptions to Scripts/lint.sh. One per line:
+#
+#     <rule-id> | <path glob> | <substring of the offending line, or * for any>
+#
+# All three fields must match. Blank lines and lines starting with # are ignored. Keep every entry
+# justified by a comment: an unexplained exception is how a policy rule quietly stops meaning anything.
+# `Scripts/lint.sh --rules` prints the rule ids.
+
+# Machine parsing, not presentation: en_US_POSIX is the fixed locale that makes `Decimal(string:)` read
+# "1.5" the same way on every Mac. It is not a user-facing locale, so it must not trip `locale-region`.
+locale-region | Sources/CodometerCodex/Rollout/CodexRolloutParser.swift | en_US_POSIX
+locale-region | Sources/CodometerCodex/AppServer/CodexAppServerProbe.swift | en_US_POSIX
+
+# The one place allowed to touch the defaults system: it writes the app-domain AppleLanguages so macOS
+# draws its own chrome (menus, open panels, alert buttons) in the language chosen in Settings.
+user-defaults | Sources/CodometerApp/Shell/LanguageDefaults.swift | *
+
+# The Settings window remembers its position. AppKit stores it as "NSWindow Frame CodometerSettings".
+window-autosave | Sources/CodometerApp/Shell/SettingsWindowController.swift | CodometerSettings
+
+# NOTARY_ARGS is declared empty and filled by resolve_notary_credentials, which always sets at least two
+# elements before it returns success. Both expansions sit behind `SIGN_MODE == developer-id`, which
+# release.sh only reaches after that success, so the array is never expanded while empty. Keep it that
+# way: the credentials cannot be passed as "no arguments", so there is nothing to make safe by default.
+shell-empty-array | Scripts/lib/notarize.sh | ${NOTARY_ARGS[@]}
+
+# AppKit only turns an uncaught exception into a crash report when this default is registered, and it must be
+# registered in `main()` before NSApplication starts. It is the one other defaults key
+# Codometer writes; the `defaults-key` rule already allows the key by name.
+user-defaults | Sources/CodometerApp/Services/CrashCapture.swift | NSApplicationCrashOnExceptions
+
+# "Erase All Data" removes everything Codometer wrote, and the preferences domain and the Settings window's
+# saved frame are part of that. It removes the whole domain by bundle id
+# and the one autosave name SettingsWindowController registers; it never reads or writes a defaults key.
+user-defaults | Sources/CodometerApp/Shell/AppController+Data.swift | removePersistentDomain
+window-autosave | Sources/CodometerApp/Shell/AppController+Data.swift | CodometerSettings
+window-autosave | Sources/CodometerApp/Shell/AppController+Data.swift | settingsFrameAutosaveName

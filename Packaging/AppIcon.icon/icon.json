@@ -1,0 +1,37 @@
+{
+  "fill" : {
+    "linear-gradient" : [
+      "display-p3:0.13000,0.14000,0.18000,1.00000",
+      "display-p3:0.04000,0.04500,0.06000,1.00000"
+    ]
+  },
+  "groups" : [
+    {
+      "name" : "gauge",
+      "layers" : [
+        { "name" : "ring-track", "image-name" : "ring-track.png" },
+        { "name" : "ring-arc", "image-name" : "ring-arc.png" }
+      ],
+      "specular" : true
+    },
+    {
+      "name" : "island",
+      "layers" : [
+        { "name" : "island", "image-name" : "island.png" }
+      ],
+      "glass" : true,
+      "specular" : true,
+      "translucency" : { "enabled" : true, "value" : 0.35 }
+    },
+    {
+      "name" : "drop",
+      "layers" : [
+        { "name" : "droplet", "image-name" : "droplet.png" }
+      ],
+      "glass" : true,
+      "specular" : true,
+      "translucency" : { "enabled" : true, "value" : 0.20 }
+    }
+  ],
+  "supported-platforms" : { "squares" : [ "macOS" ] }
+}
